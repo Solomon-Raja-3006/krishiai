@@ -8,3 +8,7 @@ torchvision==0.8.1+cpu
 requests
 Pillow
 gunicorn==20.0.4
+python-dotenv
+configparser==5.3.0
+setuptools>=60.0.0
+wheel
