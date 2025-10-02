@@ -1,265 +1,284 @@
-# Importing essential libraries and modules
+# app.py
+import os
+import io
+import json
+import traceback
 
-from flask import Flask, render_template, request, Markup
+from flask import Flask, request, jsonify, redirect
+from flask_cors import CORS
 import numpy as np
 import pandas as pd
-from utils.disease import disease_dic
-from utils.fertilizer import fertilizer_dic
 import requests
-import config
 import pickle
-import io
 import torch
 from torchvision import transforms
 from PIL import Image
+
+# local utilities (ensure these exist in utils/)
+from utils.disease import disease_dic
+from utils.fertilizer import fertilizer_dic
 from utils.model import ResNet9
-# ==============================================================================================
+import config
 
-# -------------------------LOADING THE TRAINED MODELS -----------------------------------------------
+# -------------------- App setup --------------------
+app = Flask(__name__)
+CORS(app)  # allow cross-origin requests; adjust for production to restrict origins
 
-# Loading plant disease classification model
+# -------------------- Model paths & loading --------------------
+# Ensure these paths match your repo layout
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DISEASE_MODEL_PATH = os.path.join(BASE_DIR, "models", "plant_disease_model.pth")
+CROP_MODEL_PATH = os.path.join(BASE_DIR, "models", "RandomForest.pkl")
+FERTILIZER_CSV_PATH = os.path.join(BASE_DIR, "Data", "fertilizer.csv")  # change if needed
 
-disease_classes = ['Apple___Apple_scab',
-                   'Apple___Black_rot',
-                   'Apple___Cedar_apple_rust',
-                   'Apple___healthy',
-                   'Blueberry___healthy',
-                   'Cherry_(including_sour)___Powdery_mildew',
-                   'Cherry_(including_sour)___healthy',
-                   'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot',
-                   'Corn_(maize)___Common_rust_',
-                   'Corn_(maize)___Northern_Leaf_Blight',
-                   'Corn_(maize)___healthy',
-                   'Grape___Black_rot',
-                   'Grape___Esca_(Black_Measles)',
-                   'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)',
-                   'Grape___healthy',
-                   'Orange___Haunglongbing_(Citrus_greening)',
-                   'Peach___Bacterial_spot',
-                   'Peach___healthy',
-                   'Pepper,_bell___Bacterial_spot',
-                   'Pepper,_bell___healthy',
-                   'Potato___Early_blight',
-                   'Potato___Late_blight',
-                   'Potato___healthy',
-                   'Raspberry___healthy',
-                   'Soybean___healthy',
-                   'Squash___Powdery_mildew',
-                   'Strawberry___Leaf_scorch',
-                   'Strawberry___healthy',
-                   'Tomato___Bacterial_spot',
-                   'Tomato___Early_blight',
-                   'Tomato___Late_blight',
-                   'Tomato___Leaf_Mold',
-                   'Tomato___Septoria_leaf_spot',
-                   'Tomato___Spider_mites Two-spotted_spider_mite',
-                   'Tomato___Target_Spot',
-                   'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
-                   'Tomato___Tomato_mosaic_virus',
-                   'Tomato___healthy']
+# disease classes (keep as in your original)
+disease_classes = [
+    'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
+    'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew',
+    'Cherry_(including_sour)___healthy',
+    'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot', 'Corn_(maize)___Common_rust_',
+    'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy',
+    'Grape___Black_rot', 'Grape___Esca_(Black_Measles)', 'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)',
+    'Grape___healthy', 'Orange___Haunglongbing_(Citrus_greening)', 'Peach___Bacterial_spot',
+    'Peach___healthy', 'Pepper,_bell___Bacterial_spot', 'Pepper,_bell___healthy',
+    'Potato___Early_blight', 'Potato___Late_blight', 'Potato___healthy', 'Raspberry___healthy',
+    'Soybean___healthy', 'Squash___Powdery_mildew', 'Strawberry___Leaf_scorch',
+    'Strawberry___healthy', 'Tomato___Bacterial_spot', 'Tomato___Early_blight',
+    'Tomato___Late_blight', 'Tomato___Leaf_Mold', 'Tomato___Septoria_leaf_spot',
+    'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot',
+    'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus', 'Tomato___healthy'
+]
 
-disease_model_path = 'models/plant_disease_model.pth'
-disease_model = ResNet9(3, len(disease_classes))
-disease_model.load_state_dict(torch.load(
-    disease_model_path, map_location=torch.device('cpu')))
-disease_model.eval()
+# Load disease model
+try:
+    disease_model = ResNet9(3, len(disease_classes))
+    disease_model.load_state_dict(torch.load(DISEASE_MODEL_PATH, map_location=torch.device('cpu')))
+    disease_model.eval()
+except Exception as e:
+    disease_model = None
+    print("ERROR loading disease model:", e)
 
+# Load crop recommendation model (pickle)
+try:
+    with open(CROP_MODEL_PATH, "rb") as f:
+        crop_recommendation_model = pickle.load(f)
+except Exception as e:
+    crop_recommendation_model = None
+    print("ERROR loading crop recommendation model:", e)
 
-# Loading crop recommendation model
-
-crop_recommendation_model_path = 'models/RandomForest.pkl'
-crop_recommendation_model = pickle.load(
-    open(crop_recommendation_model_path, 'rb'))
-
-
-# =========================================================================================
-
-# Custom functions for calculations
-
-
+# -------------------- utilities --------------------
 def weather_fetch(city_name):
     """
-    Fetch and returns the temperature and humidity of a city
-    :params: city_name
-    :return: temperature, humidity
+    Fetch temperature (C) and humidity (%) for a city via OpenWeatherMap.
+    Returns tuple (temperature, humidity) or None if city not found.
     """
-    api_key = config.weather_api_key
-    base_url = "http://api.openweathermap.org/data/2.5/weather?"
-
-    complete_url = base_url + "appid=" + api_key + "&q=" + city_name
-    response = requests.get(complete_url)
-    x = response.json()
-
-    if x["cod"] != "404":
-        y = x["main"]
-
-        temperature = round((y["temp"] - 273.15), 2)
-        humidity = y["humidity"]
-        return temperature, humidity
-    else:
+    try:
+        api_key = config.weather_api_key
+        if not api_key:
+            return None
+        base_url = "http://api.openweathermap.org/data/2.5/weather?"
+        complete_url = f"{base_url}appid={api_key}&q={city_name}"
+        response = requests.get(complete_url, timeout=8)
+        x = response.json()
+        if x.get("cod") and str(x.get("cod")) != "404":
+            y = x["main"]
+            temperature = round((y["temp"] - 273.15), 2)
+            humidity = y["humidity"]
+            return temperature, humidity
+        return None
+    except Exception:
         return None
 
+def predict_image_bytes(img_bytes, model=disease_model):
+    """
+    Transforms image bytes -> tensor -> model prediction label string.
+    """
+    if model is None:
+        raise RuntimeError("disease model not loaded")
 
-def predict_image(img, model=disease_model):
-    """
-    Transforms image to tensor and predicts disease label
-    :params: image
-    :return: prediction (string)
-    """
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.ToTensor(),
-    ])
-    image = Image.open(io.BytesIO(img))
+    transform = transforms.Compose([transforms.Resize(256), transforms.ToTensor()])
+    image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img_t = transform(image)
     img_u = torch.unsqueeze(img_t, 0)
-
-    # Get predictions from model
-    yb = model(img_u)
-    # Pick index with highest probability
-    _, preds = torch.max(yb, dim=1)
+    with torch.no_grad():
+        yb = model(img_u)
+        _, preds = torch.max(yb, dim=1)
     prediction = disease_classes[preds[0].item()]
-    # Retrieve the class label
     return prediction
 
-# ===============================================================================================
-# ------------------------------------ FLASK APP -------------------------------------------------
+def parse_int_field(d, key, default=None, required=False):
+    """Utility: parse integer from dict/form"""
+    val = d.get(key)
+    if val is None:
+        if required:
+            raise ValueError(f"Missing required field: {key}")
+        return default
+    return int(val)
 
+def parse_float_field(d, key, default=None, required=False):
+    val = d.get(key)
+    if val is None:
+        if required:
+            raise ValueError(f"Missing required field: {key}")
+        return default
+    return float(val)
 
-app = Flask(__name__)
+# -------------------- Routes (JSON APIs) --------------------
 
-# render home page
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "success": True,
+        "data": {
+            "message": "KrishiAI API running",
+            "endpoints": {
+                "POST /crop-predict": "json/form -> {nitrogen, phosphorous, pottasium, ph, rainfall, city}",
+                "POST /fertilizer-predict": "json/form -> {cropname, nitrogen, phosphorous, pottasium}",
+                "POST /disease-predict": "multipart/form-data -> file (image)"
+            }
+        }
+    })
 
-
-@ app.route('/')
-def home():
-    title = 'KRISHI.AI - Home'
-    return render_template('index.html', title=title)
-
-# render crop recommendation form page
-
-
-@ app.route('/crop-recommend')
-def crop_recommend():
-    title = 'KRISHI.AI - Crop Recommendation'
-    return render_template('crop.html', title=title)
-
-# render fertilizer recommendation form page
-
-
-@ app.route('/fertilizer')
-def fertilizer_recommendation():
-    title = 'KRISHI.AI - Fertilizer Suggestion'
-
-    return render_template('fertilizer.html', title=title)
-
-# render disease prediction input page
-
-
-
-
-# ===============================================================================================
-
-# RENDER PREDICTION PAGES
-
-# render crop recommendation result page
-
-
-@ app.route('/crop-predict', methods=['POST'])
+@app.route("/crop-predict", methods=["POST"])
 def crop_prediction():
-    title = 'KRISHI.AI - Crop Recommendation'
+    """
+    Accepts JSON or form-data fields:
+    - nitrogen (N)
+    - phosphorous (P)
+    - pottasium (K)
+    - ph
+    - rainfall
+    - city (for weather)
+    Returns: recommended_crop and model details
+    """
+    try:
+        payload = request.get_json(silent=True) or request.form
+        # allow both field names for clarity
+        N = parse_int_field(payload, "nitrogen", required=True)
+        P = parse_int_field(payload, "phosphorous", required=True)
+        K = parse_int_field(payload, "pottasium", required=True)
+        ph = parse_float_field(payload, "ph", required=True)
+        rainfall = parse_float_field(payload, "rainfall", required=True)
+        city = payload.get("city")
 
-    if request.method == 'POST':
-        N = int(request.form['nitrogen'])
-        P = int(request.form['phosphorous'])
-        K = int(request.form['pottasium'])
-        ph = float(request.form['ph'])
-        rainfall = float(request.form['rainfall'])
-
-        # state = request.form.get("stt")
-        city = request.form.get("city")
-
-        if weather_fetch(city) != None:
-            temperature, humidity = weather_fetch(city)
-            data = np.array([[N, P, K, temperature, humidity, ph, rainfall]])
-            my_prediction = crop_recommendation_model.predict(data)
-            final_prediction = my_prediction[0]
-
-            return render_template('crop-result.html', prediction=final_prediction, title=title)
-
+        # fetch weather if city provided
+        if city:
+            wh = weather_fetch(city)
+            if wh is None:
+                return jsonify({"success": False, "error": "city not found or weather API key missing"}), 400
+            temperature, humidity = wh
         else:
+            # If city not provided, you may allow caller to pass temperature/humidity directly
+            temperature = parse_float_field(payload, "temperature", default=25.0)
+            humidity = parse_float_field(payload, "humidity", default=50.0)
 
-            return render_template('try_again.html', title=title)
+        if crop_recommendation_model is None:
+            return jsonify({"success": False, "error": "crop recommendation model not loaded"}), 500
 
-# render fertilizer recommendation result page
+        data = np.array([[N, P, K, temperature, humidity, ph, rainfall]])
+        my_prediction = crop_recommendation_model.predict(data)
+        final_prediction = str(my_prediction[0])
 
+        return jsonify({"success": True, "data": {"recommended_crop": final_prediction}})
 
-@ app.route('/fertilizer-predict', methods=['POST'])
-def fert_recommend():
-    title = 'KRISHI.AI - Fertilizer Suggestion'
+    except ValueError as ve:
+        return jsonify({"success": False, "error": str(ve)}), 400
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": "internal server error", "details": str(e)}), 500
 
-    crop_name = str(request.form['cropname'])
-    N = int(request.form['nitrogen'])
-    P = int(request.form['phosphorous'])
-    K = int(request.form['pottasium'])
-    # ph = float(request.form['ph'])
+@app.route("/fertilizer-predict", methods=["POST"])
+def fertilizer_prediction():
+    """
+    Accepts JSON or form-data:
+    - cropname
+    - nitrogen, phosphorous, pottasium
+    Returns fertilizer recommendation string (from fertilizer_dic)
+    """
+    try:
+        payload = request.get_json(silent=True) or request.form
+        crop_name = payload.get("cropname")
+        if not crop_name:
+            return jsonify({"success": False, "error": "cropname is required"}), 400
 
-    df = pd.read_csv('C:/Users/srini/Desktop/ML/Agro/Harvestify-master/Harvestify-master/app/Data/fertilizer.csv')
+        N = parse_int_field(payload, "nitrogen", required=True)
+        P = parse_int_field(payload, "phosphorous", required=True)
+        K = parse_int_field(payload, "pottasium", required=True)
 
-    nr = df[df['Crop'] == crop_name]['N'].iloc[0]
-    pr = df[df['Crop'] == crop_name]['P'].iloc[0]
-    kr = df[df['Crop'] == crop_name]['K'].iloc[0]
-
-    n = nr - N
-    p = pr - P
-    k = kr - K
-    temp = {abs(n): "N", abs(p): "P", abs(k): "K"}
-    max_value = temp[max(temp.keys())]
-    if max_value == "N":
-        if n < 0:
-            key = 'NHigh'
+        # load fertilizer csv (lazy load each request; small file so ok)
+        if not os.path.exists(FERTILIZER_CSV_PATH):
+            # try common fallback path
+            alt_path = os.path.join(BASE_DIR, "app", "Data", "fertilizer.csv")
+            if os.path.exists(alt_path):
+                df = pd.read_csv(alt_path)
+            else:
+                return jsonify({"success": False, "error": f"fertilizer csv not found at {FERTILIZER_CSV_PATH}"}), 500
         else:
-            key = "Nlow"
-    elif max_value == "P":
-        if p < 0:
-            key = 'PHigh'
+            df = pd.read_csv(FERTILIZER_CSV_PATH)
+
+        # ensure crop exists in CSV (case-insensitive match)
+        crop_rows = df[df['Crop'].str.lower() == crop_name.lower()]
+        if crop_rows.empty:
+            return jsonify({"success": False, "error": f"crop '{crop_name}' not found in fertilizer dataset"}), 400
+
+        nr = crop_rows['N'].iloc[0]
+        pr = crop_rows['P'].iloc[0]
+        kr = crop_rows['K'].iloc[0]
+
+        n = nr - N
+        p = pr - P
+        k = kr - K
+        temp_map = {abs(n): "N", abs(p): "P", abs(k): "K"}
+        max_value = temp_map[max(temp_map.keys())]
+
+        if max_value == "N":
+            key = 'NHigh' if n < 0 else "Nlow"
+        elif max_value == "P":
+            key = 'PHigh' if p < 0 else "Plow"
         else:
-            key = "Plow"
-    else:
-        if k < 0:
-            key = 'KHigh'
-        else:
-            key = "Klow"
+            key = 'KHigh' if k < 0 else "Klow"
 
-    response = Markup(str(fertilizer_dic[key]))
+        recommendation_text = fertilizer_dic.get(key, "No recommendation found")
+        return jsonify({"success": True, "data": {"recommendation_key": key, "recommendation": recommendation_text}})
 
-    return render_template('fertilizer-result.html', recommendation=response, title=title)
+    except ValueError as ve:
+        return jsonify({"success": False, "error": str(ve)}), 400
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": "internal server error", "details": str(e)}), 500
 
-# render disease prediction result page
-
-
-@app.route('/disease-predict', methods=['GET', 'POST'])
+@app.route("/disease-predict", methods=["POST"])
 def disease_prediction():
-    title = 'KRISHI.AI - Disease Detection'
-
-    if request.method == 'POST':
+    """
+    Accepts multipart/form-data with 'file' (image).
+    Returns disease label and human-friendly explanation from disease_dic.
+    """
+    try:
         if 'file' not in request.files:
-            return redirect(request.url)
+            return jsonify({"success": False, "error": "file (image) is required"}), 400
+
         file = request.files.get('file')
-        if not file:
-            return render_template('disease.html', title=title)
-        try:
-            img = file.read()
+        if file.filename == "":
+            return jsonify({"success": False, "error": "empty filename"}), 400
 
-            prediction = predict_image(img)
+        img_bytes = file.read()
+        if not img_bytes:
+            return jsonify({"success": False, "error": "empty file"}), 400
 
-            prediction = Markup(str(disease_dic[prediction]))
-            return render_template('disease-result.html', prediction=prediction, title=title)
-        except:
-            pass
-    return render_template('disease.html', title=title)
+        if disease_model is None:
+            return jsonify({"success": False, "error": "disease model not loaded"}), 500
 
+        raw_pred = predict_image_bytes(img_bytes)
+        explanation = disease_dic.get(raw_pred, "No description available")
 
-# ===============================================================================================
-if __name__ == '__main__':
-    app.run(debug=False)
+        return jsonify({"success": True, "data": {"disease_label": raw_pred, "explanation": explanation}})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": "internal server error", "details": str(e)}), 500
+
+# -------------------- run server --------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    # bind 0.0.0.0 for Cloud Run
+    app.run(host="0.0.0.0", port=port, debug=False)
